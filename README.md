@@ -3,7 +3,7 @@ Records every single keyboard input with millisecond precision
 
 # Input Macro Recorder
 
-A G Hub–style macro recorder, with mouse movement, written in Python.
+The ultimate macro recorder, with mouse movement, written in Python.
 
 ## Setup
 
