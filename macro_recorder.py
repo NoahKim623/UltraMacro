@@ -28,10 +28,25 @@ from pynput.mouse import Controller as MouseController, Button
 
 
 # ---------- Config ----------
-TOGGLE_KEY = Key.f5            # Press this anywhere to start/stop recording
+TOGGLE_KEY = Key.f5            # Start/stop recording
+PLAY_KEY   = Key.f6            # Play the recording once
+STOP_KEY   = Key.f7            # Force-stop playback
 DEFAULT_MOUSE_THROTTLE_MS = 10 # Lower = smoother + heavier; 0 = capture all
-PLAYBACK_COUNTDOWN_MS = 1500   # Delay before playback so you can refocus
+PLAYBACK_COUNTDOWN_MS = 10     # Tiny delay before playback so the F6 keypress
+                               # finishes registering before the player takes over
+START_GRACE_MS = 250           # Ignore mouse-move events for the first 250 ms of
+                               # a recording so hand-drift on the toggle key isn't
+                               # captured. Keys and clicks are recorded immediately.
+APPEND_GAP_MS = 100            # Gap inserted between the previous recording's last
+                               # event and the first new event when the user chooses
+                               # "Continue" on the start-recording prompt.
 # ----------------------------
+
+MODE_LABELS = {
+    "keyboard": "Keystrokes only",
+    "mouse":    "Mouse only (movement + clicks + scroll)",
+    "both":     "Keyboard + Mouse",
+}
 
 
 # =====================================================================
@@ -46,28 +61,37 @@ class InputRecorder:
         self.start_time = None
         self.last_mouse_move_time = -10_000
         self.mouse_move_throttle_ms = DEFAULT_MOUSE_THROTTLE_MS
+        self.mode = "both"  # "keyboard", "mouse", or "both"
+        self._time_offset_ms = 0  # added to every event ts; non-zero in append mode
         self._kb_listener = None
         self._mouse_listener = None
 
-    def start(self):
+    def start(self, append=False):
         if self.recording:
             return
-        self.events = []
+        if append and self.events:
+            # Continue after the last existing event, with a small gap.
+            self._time_offset_ms = self.events[-1]["time"] + APPEND_GAP_MS
+        else:
+            self.events = []
+            self._time_offset_ms = 0
         self.recording = True
         self.start_time = time.perf_counter()
         self.last_mouse_move_time = -10_000
 
-        self._kb_listener = keyboard.Listener(
-            on_press=self._on_key_press,
-            on_release=self._on_key_release,
-        )
-        self._mouse_listener = mouse.Listener(
-            on_move=self._on_mouse_move,
-            on_click=self._on_mouse_click,
-            on_scroll=self._on_mouse_scroll,
-        )
-        self._kb_listener.start()
-        self._mouse_listener.start()
+        if self.mode in ("keyboard", "both"):
+            self._kb_listener = keyboard.Listener(
+                on_press=self._on_key_press,
+                on_release=self._on_key_release,
+            )
+            self._kb_listener.start()
+        if self.mode in ("mouse", "both"):
+            self._mouse_listener = mouse.Listener(
+                on_move=self._on_mouse_move,
+                on_click=self._on_mouse_click,
+                on_scroll=self._on_mouse_scroll,
+            )
+            self._mouse_listener.start()
 
     def stop(self):
         if not self.recording:
@@ -80,12 +104,17 @@ class InputRecorder:
             self._mouse_listener.stop()
             self._mouse_listener = None
 
-    def _elapsed_ms(self):
+    def _session_ms(self):
+        """ms since the current start() call. Used for the grace-period check."""
         return int((time.perf_counter() - self.start_time) * 1000)
+
+    def _elapsed_ms(self):
+        """Timestamp for a new event: append offset + session time."""
+        return self._time_offset_ms + self._session_ms()
 
     # ---- Keyboard ----
     def _on_key_press(self, key):
-        if not self.recording or key == TOGGLE_KEY:
+        if not self.recording or key in (TOGGLE_KEY, PLAY_KEY, STOP_KEY):
             return
         self.events.append({
             "time": self._elapsed_ms(),
@@ -94,7 +123,7 @@ class InputRecorder:
         })
 
     def _on_key_release(self, key):
-        if not self.recording or key == TOGGLE_KEY:
+        if not self.recording or key in (TOGGLE_KEY, PLAY_KEY, STOP_KEY):
             return
         self.events.append({
             "time": self._elapsed_ms(),
@@ -106,6 +135,8 @@ class InputRecorder:
     def _on_mouse_move(self, x, y):
         if not self.recording:
             return
+        if self._session_ms() < START_GRACE_MS:
+            return  # ignore hand-drift right after the toggle key
         now = self._elapsed_ms()
         if now - self.last_mouse_move_time < self.mouse_move_throttle_ms:
             return
@@ -168,18 +199,22 @@ class MacroPlayer:
         self.kb = KeyboardController()
         self.mouse = MouseController()
         self.playing = False
+        self._stopped_externally = False
         self._thread = None
 
     def play(self, events, on_complete=None):
         if self.playing or not events:
             return
         self.playing = True
+        self._stopped_externally = False
         self._thread = threading.Thread(
             target=self._run, args=(list(events), on_complete), daemon=True
         )
         self._thread.start()
 
     def stop(self):
+        if self.playing:
+            self._stopped_externally = True
         self.playing = False
 
     def _run(self, events, on_complete):
@@ -199,9 +234,10 @@ class MacroPlayer:
                     break
                 self._execute(ev)
         finally:
+            interrupted = self._stopped_externally
             self.playing = False
             if on_complete:
-                on_complete()
+                on_complete(interrupted)
 
     def _execute(self, ev):
         t = ev["type"]
@@ -227,6 +263,60 @@ class MacroPlayer:
 # =====================================================================
 # GUI
 # =====================================================================
+# =====================================================================
+# Home screen
+# =====================================================================
+class HomeFrame(ttk.Frame):
+    """Landing page that lets the user pick what to record."""
+
+    def __init__(self, parent, on_choose):
+        super().__init__(parent, padding=40)
+        self.on_choose = on_choose
+
+        # Center column
+        center = ttk.Frame(self)
+        center.place(relx=0.5, rely=0.5, anchor="center")
+
+        ttk.Label(
+            center, text="Input Macro Recorder",
+            font=("Segoe UI", 22, "bold"),
+        ).pack(pady=(0, 6))
+        ttk.Label(
+            center, text="What would you like to record?",
+            font=("Segoe UI", 12), foreground="#555",
+        ).pack(pady=(0, 24))
+
+        options = [
+            ("⌨   Keystrokes Only",
+             "Capture only key presses and releases.",
+             "keyboard"),
+            ("🖱   Mouse Only",
+             "Capture mouse movement, clicks, and scrolls.",
+             "mouse"),
+            ("⌨ + 🖱   Both",
+             "Capture everything — keyboard and mouse together.",
+             "both"),
+        ]
+
+        style = ttk.Style()
+        try:
+            style.configure("Mode.TButton", font=("Segoe UI", 13, "bold"), padding=(20, 12))
+        except tk.TclError:
+            pass
+
+        for title, subtitle, mode in options:
+            row = ttk.Frame(center)
+            row.pack(fill="x", pady=6)
+            ttk.Button(
+                row, text=title, style="Mode.TButton", width=32,
+                command=lambda m=mode: self.on_choose(m),
+            ).pack()
+            ttk.Label(row, text=subtitle, foreground="#666").pack(pady=(2, 0))
+
+
+# =====================================================================
+# Main app
+# =====================================================================
 class MacroApp:
     def __init__(self, root):
         self.root = root
@@ -235,9 +325,50 @@ class MacroApp:
 
         self.recorder = InputRecorder()
         self.player = MacroPlayer()
+        self._pre_play_pos = None  # mouse position before play; restored on clean finish
 
-        self._build_ui()
+        # Swappable content area: holds either the home screen or the recorder UI.
+        self._content = ttk.Frame(self.root)
+        self._content.pack(fill="both", expand=True)
+
         self._install_global_hotkey()
+        self.show_home()
+
+    # ---- View switching ----
+    def show_home(self):
+        for w in self._content.winfo_children():
+            w.destroy()
+        HomeFrame(self._content, on_choose=self._start_session).pack(
+            fill="both", expand=True
+        )
+
+    def show_recorder(self):
+        for w in self._content.winfo_children():
+            w.destroy()
+        self._build_ui()
+
+    def _start_session(self, mode):
+        """Called from the home screen after the user picks a mode."""
+        if self.recorder.recording:
+            self.recorder.stop()
+        if self.player.playing:
+            self.player.stop()
+        self.recorder.mode = mode
+        self.recorder.events = []
+        self.show_recorder()
+
+    def _go_home(self):
+        if self.recorder.events and not messagebox.askyesno(
+            "Return to home?",
+            "Going home will discard the current macro. Continue?",
+        ):
+            return
+        if self.recorder.recording:
+            self.recorder.stop()
+        if self.player.playing:
+            self.player.stop()
+        self.recorder.events = []
+        self.show_home()
 
     # ---- UI construction ----
     def _build_ui(self):
@@ -247,9 +378,13 @@ class MacroApp:
         except tk.TclError:
             pass
 
+        parent = self._content
+
         # Top control bar
-        top = ttk.Frame(self.root, padding=(10, 10, 10, 4))
+        top = ttk.Frame(parent, padding=(10, 10, 10, 4))
         top.pack(fill="x")
+
+        ttk.Button(top, text="🏠  Home", command=self._go_home).pack(side="left", padx=(0, 10))
 
         self.status_label = ttk.Label(
             top, text="● Idle", foreground="gray", font=("Segoe UI", 12, "bold")
@@ -258,22 +393,29 @@ class MacroApp:
 
         ttk.Button(top, text=f"Toggle Record  ({key_to_str(TOGGLE_KEY).upper()})",
                    command=self.toggle_recording).pack(side="left", padx=4)
-        ttk.Button(top, text="▶  Play",        command=self.play_macro).pack(side="left", padx=4)
-        ttk.Button(top, text="■  Stop",        command=self.stop_playback).pack(side="left", padx=4)
+        ttk.Button(top, text=f"▶  Play  ({key_to_str(PLAY_KEY).upper()})",
+                   command=self.play_macro).pack(side="left", padx=4)
+        ttk.Button(top, text=f"■  Stop  ({key_to_str(STOP_KEY).upper()})",
+                   command=self.stop_playback).pack(side="left", padx=4)
         ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=8)
         ttk.Button(top, text="Save…",          command=self.save_macro).pack(side="left", padx=4)
         ttk.Button(top, text="Load…",          command=self.load_macro).pack(side="left", padx=4)
         ttk.Button(top, text="Clear",          command=self.clear_events).pack(side="left", padx=4)
 
         # Settings row
-        settings = ttk.Frame(self.root, padding=(10, 0, 10, 6))
+        settings = ttk.Frame(parent, padding=(10, 0, 10, 6))
         settings.pack(fill="x")
+        ttk.Label(settings, text=f"Mode: {MODE_LABELS[self.recorder.mode]}",
+                  font=("Segoe UI", 9, "bold"), foreground="#2c81e0").pack(side="left", padx=(0, 16))
         ttk.Label(settings, text="Mouse-move sample interval (ms):").pack(side="left")
         self.throttle_var = tk.IntVar(value=DEFAULT_MOUSE_THROTTLE_MS)
-        ttk.Spinbox(
+        self.throttle_spin = ttk.Spinbox(
             settings, from_=0, to=500, textvariable=self.throttle_var, width=6,
             command=self._update_throttle,
-        ).pack(side="left", padx=6)
+        )
+        self.throttle_spin.pack(side="left", padx=6)
+        if self.recorder.mode == "keyboard":
+            self.throttle_spin.state(["disabled"])
         ttk.Label(
             settings,
             text="(0 = record every move; higher = lighter timeline)",
@@ -281,7 +423,7 @@ class MacroApp:
         ).pack(side="left", padx=8)
 
         # Timeline
-        tl_frame = ttk.LabelFrame(self.root, text="Timeline", padding=8)
+        tl_frame = ttk.LabelFrame(parent, text="Timeline", padding=8)
         tl_frame.pack(fill="both", expand=True, padx=10, pady=(4, 4))
 
         cols = ("idx", "delay", "abs", "type", "details")
@@ -307,7 +449,7 @@ class MacroApp:
         self.tree.bind("<Double-1>", self._on_double_click)
 
         # Edit row
-        edit = ttk.Frame(self.root, padding=10)
+        edit = ttk.Frame(parent, padding=10)
         edit.pack(fill="x")
         ttk.Label(edit, text="Delay before selected event (ms):").pack(side="left")
         self.delay_var = tk.StringVar()
@@ -320,20 +462,24 @@ class MacroApp:
 
         # Hint footer
         hint = ttk.Label(
-            self.root,
+            parent,
             text=("Tip: double-click a row's delay to edit it inline. "
-                  "Press F5 anywhere on your system to start/stop recording."),
+                  "F5 = record toggle, F6 = play once, F7 = force-stop."),
             foreground="#666",
             padding=(10, 0, 10, 8),
         )
         hint.pack(fill="x")
 
     def _install_global_hotkey(self):
-        """Listen for the toggle key system-wide so the app needn't be focused."""
+        """Listen for the record / play / stop keys system-wide."""
         def on_press(key):
             if key == TOGGLE_KEY:
                 # Must marshal back to Tk's main thread
                 self.root.after(0, self.toggle_recording)
+            elif key == PLAY_KEY:
+                self.root.after(0, self.play_macro)
+            elif key == STOP_KEY:
+                self.root.after(0, self.stop_playback)
         self._hotkey_listener = keyboard.Listener(on_press=on_press)
         self._hotkey_listener.daemon = True
         self._hotkey_listener.start()
@@ -352,10 +498,23 @@ class MacroApp:
             self.recorder.stop()
             self.status_label.config(text="● Idle", foreground="gray")
             self.refresh_timeline()
-        else:
-            self._update_throttle()
-            self.recorder.start()
-            self.status_label.config(text="● RECORDING", foreground="#c0392b")
+            return
+
+        # Starting fresh — if there's already a recording, ask what to do.
+        append = False
+        if self.recorder.events:
+            choice = StartRecordingDialog(self.root).result
+            if choice is None:
+                return  # cancelled
+            if choice == "delete":
+                self.recorder.events = []
+            else:  # "continue"
+                append = True
+
+        self._update_throttle()
+        self.recorder.start(append=append)
+        self.refresh_timeline()  # show empty (delete) or existing (continue)
+        self.status_label.config(text="● RECORDING", foreground="#c0392b")
 
     def play_macro(self):
         if not self.recorder.events:
@@ -366,21 +525,28 @@ class MacroApp:
             return
         if self.player.playing:
             return
-        self.status_label.config(text=f"▶ Playing in {PLAYBACK_COUNTDOWN_MS} ms…",
-                                 foreground="#2c81e0")
-        # Brief delay so the user can refocus their target window
+        # Remember the mouse position so we can restore it after a clean finish.
+        self._pre_play_pos = self.player.mouse.position
+        self.status_label.config(text="▶ Playing…", foreground="#2c81e0")
+        # Brief delay so the OS finishes processing the F6 keypress before playback starts
         self.root.after(
             PLAYBACK_COUNTDOWN_MS,
-            lambda: (
-                self.status_label.config(text="▶ Playing…", foreground="#2c81e0"),
-                self.player.play(
-                    self.recorder.events,
-                    on_complete=lambda: self.root.after(0, self._on_playback_done),
+            lambda: self.player.play(
+                self.recorder.events,
+                on_complete=lambda interrupted: self.root.after(
+                    0, lambda: self._on_playback_done(interrupted)
                 ),
             ),
         )
 
-    def _on_playback_done(self):
+    def _on_playback_done(self, interrupted=False):
+        # Restore mouse only on a clean finish — F7 / Stop leaves it where it ended.
+        if not interrupted and self._pre_play_pos is not None:
+            try:
+                self.player.mouse.position = self._pre_play_pos
+            except Exception:
+                pass
+        self._pre_play_pos = None
         self.status_label.config(text="● Idle", foreground="gray")
 
     def stop_playback(self):
@@ -559,6 +725,56 @@ class MacroApp:
         for idx in indices:
             del self.recorder.events[idx]
         self.refresh_timeline()
+
+
+# =====================================================================
+# Dialog: F5 pressed with an existing recording
+# =====================================================================
+class StartRecordingDialog(tk.Toplevel):
+    """Returns 'delete', 'continue', or None (cancel) via self.result."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Start recording")
+        self.transient(parent)
+        self.resizable(False, False)
+        self.result = None
+
+        ttk.Label(
+            self,
+            text="There's already a recording.\nWhat would you like to do?",
+            justify="center",
+            padding=(24, 18, 24, 6),
+        ).pack()
+
+        btns = ttk.Frame(self)
+        btns.pack(padx=20, pady=(6, 16))
+        ttk.Button(btns, text="Delete & start fresh",
+                   command=lambda: self._set("delete")).pack(side="left", padx=4)
+        cont_btn = ttk.Button(btns, text="Continue (append)",
+                              command=lambda: self._set("continue"))
+        cont_btn.pack(side="left", padx=4)
+        cont_btn.focus()
+        ttk.Button(btns, text="Cancel",
+                   command=lambda: self._set(None)).pack(side="left", padx=4)
+
+        self.bind("<Return>", lambda _e: self._set("continue"))
+        self.bind("<Escape>", lambda _e: self._set(None))
+        self.protocol("WM_DELETE_WINDOW", lambda: self._set(None))
+
+        # Center over the parent window
+        self.update_idletasks()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        dw, dh = self.winfo_width(), self.winfo_height()
+        self.geometry(f"+{px + (pw - dw) // 2}+{py + (ph - dh) // 2}")
+
+        self.grab_set()
+        self.wait_window()
+
+    def _set(self, result):
+        self.result = result
+        self.destroy()
 
 
 # =====================================================================
